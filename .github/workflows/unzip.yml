@@ -1,0 +1,118 @@
+name: Extract Uploaded ZIP
+
+on:
+  push:
+    paths:
+      - '**/*.zip'
+      - '*.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: extract-uploaded-zip-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find and safely extract ZIP
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import os
+          import shutil
+          import stat
+
+          repo = Path.cwd()
+          archives = [
+              p for p in repo.rglob("*.zip")
+              if ".git" not in p.parts
+          ]
+
+          if len(archives) != 1:
+              raise SystemExit(
+                  f"Expected exactly one ZIP archive in the repository; found {len(archives)}."
+              )
+
+          archive = archives[0]
+          print(f"Extracting: {archive.relative_to(repo)}")
+
+          with ZipFile(archive) as zf:
+              members = [i for i in zf.infolist() if i.filename]
+
+              # Reject absolute paths, parent traversal, and symbolic links.
+              safe_members = []
+              for info in members:
+                  name = info.filename.replace("\\", "/")
+                  parts = Path(name).parts
+
+                  if name.startswith("/") or any(part == ".." for part in parts):
+                      raise SystemExit(f"Unsafe ZIP entry: {info.filename}")
+
+                  unix_mode = (info.external_attr >> 16) & 0xFFFF
+                  if stat.S_ISLNK(unix_mode):
+                      raise SystemExit(f"Symbolic links are not allowed: {info.filename}")
+
+                  safe_members.append((info, parts))
+
+              # If the ZIP contains one wrapper directory (e.g. FreeCPP/),
+              # remove that directory level so the project files land in the repo root.
+              files = [(i, p) for i, p in safe_members if not i.is_dir()]
+              first_parts = [p for _, p in files]
+
+              strip_root = False
+              if first_parts and all(len(p) >= 2 for p in first_parts):
+                  roots = {p[0] for p in first_parts}
+                  strip_root = len(roots) == 1
+
+              for info, parts in safe_members:
+                  if not parts:
+                      continue
+
+                  relative = Path(*parts[1:]) if strip_root else Path(*parts)
+                  if str(relative) in ("", "."):
+                      continue
+
+                  destination = (repo / relative).resolve()
+                  if repo.resolve() not in destination.parents and destination != repo.resolve():
+                      raise SystemExit(f"ZIP entry escapes repository: {info.filename}")
+
+                  if info.is_dir():
+                      destination.mkdir(parents=True, exist_ok=True)
+                      continue
+
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(info) as source, destination.open("wb") as target:
+                      shutil.copyfileobj(source, target)
+
+          # Remove the uploaded archive after successful extraction.
+          archive.unlink()
+          print("ZIP extraction completed successfully.")
+          PY
+
+      - name: Commit extracted project files
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No extracted changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Extract uploaded project ZIP"
+          git push
